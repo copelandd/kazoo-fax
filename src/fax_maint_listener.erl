@@ -1,33 +1,48 @@
 %%%-------------------------------------------------------------------
-%%% @copyright (C) 2012-2017, 2600Hz INC
+%%% @copyright (C) 2017, 2600Hz
 %%% @doc
 %%%
 %%% @end
 %%% @contributors
-%%%   Karl Anderson
-%%%   Luis Azedo
 %%%-------------------------------------------------------------------
--module(fax_monitor).
--behaviour(gen_server).
+-module(fax_maint_listener).
+-behaviour(gen_listener).
 
--export([start_link/0]).
+-export([start_link/0
+        ,handle_req/2
+        ]).
+
 -export([init/1
         ,handle_call/3
         ,handle_cast/2
         ,handle_info/2
+        ,handle_event/2
         ,terminate/2
         ,code_change/3
         ]).
 
 -include("fax.hrl").
+-include_lib("kazoo_amqp/include/kz_amqp.hrl").
+
+-define(SERVER, ?MODULE).
+
+-define(FAXES_VIEW_FILE, <<"views/faxes.json">>).
+-define(FAXBOX_VIEW_FILE, <<"views/faxbox.json">>).
 
 -record(state, {}).
 -type state() :: #state{}.
 
--define(NAME, ?MODULE).
--define(SERVER, {'via', 'kz_globals', ?NAME}).
-
--define(POLLING_INTERVAL, 5000).
+%% By convention, we put the options here in macros, but not required.
+%% define what databases or classifications we're interested in
+-define(RESTRICTIONS, [kapi_maintenance:restrict_to_views_db(?KZ_FAXES_DB)]).
+-define(BINDINGS, [{'maintenance', [{'restrict_to', ?RESTRICTIONS}]}]).
+-define(RESPONDERS, [{{?MODULE, 'handle_req'}
+                     ,[{<<"maintenance">>, <<"req">>}]
+                     }
+                    ]).
+-define(QUEUE_NAME, <<?MODULE_STRING>>).
+-define(QUEUE_OPTIONS, [{'exclusive', 'false'}]).
+-define(CONSUME_OPTIONS, [{'exclusive', 'false'}]).
 
 %%%===================================================================
 %%% API
@@ -38,13 +53,39 @@
 %%--------------------------------------------------------------------
 -spec start_link() -> startlink_ret().
 start_link() ->
-    case gen_server:start_link(?SERVER, ?MODULE, [], []) of
-        {'error', {'already_started', Pid}}
-          when is_pid(Pid)->
-            erlang:link(Pid),
-            {'ok', Pid};
-        Other -> Other
-    end.
+    gen_listener:start_link(?SERVER
+                           ,[{'bindings', ?BINDINGS}
+                            ,{'responders', ?RESPONDERS}
+                            ,{'queue_name', ?QUEUE_NAME}       % optional to include
+                            ,{'queue_options', ?QUEUE_OPTIONS} % optional to include
+                            ,{'consume_options', ?CONSUME_OPTIONS} % optional to include
+                            ,{'declare_exchanges', [{?EXCHANGE_SYSCONF, ?TYPE_SYSCONF}]}
+                            ]
+                           ,[]
+                           ).
+
+-spec handle_req(kapi_maintenance:req(), kz_proplist()) -> 'ok'.
+handle_req(MaintJObj, _Props) ->
+    'true' = kapi_maintenance:req_v(MaintJObj),
+    handle_refresh(MaintJObj, kapi_maintenance:req_action(MaintJObj)).
+
+handle_refresh(MaintJObj, <<"refresh_views">>) ->
+    _ = kz_datamgr:revise_doc_from_file(?KZ_FAXES_DB, 'fax', ?FAXES_VIEW_FILE),
+    _ = kz_datamgr:revise_doc_from_file(?KZ_FAXES_DB, 'fax', ?FAXBOX_VIEW_FILE),
+    send_resp(MaintJObj, 'true').
+
+-spec send_resp(kapi_mainteannce:req(), 'true') -> 'ok'.
+send_resp(MaintJObj, Results) ->
+    Resp = [{<<"Code">>, code(Results)}
+           ,{<<"Message">>, message(Results)}
+           ,{<<"Msg-ID">>, kz_api:msg_id(MaintJObj)}
+            | kz_api:default_headers(?APP_NAME, ?APP_VERSION)
+           ],
+    kapi_maintenance:publish_resp(kz_api:server_id(MaintJObj), Resp).
+
+code('true') -> 200.
+
+message('true') -> <<"Success">>.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -52,24 +93,19 @@ start_link() ->
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Initializes the server
-%%
+%% @doc Initializes the server
 %% @spec init(Args) -> {ok, State} |
 %%                     {ok, State, Timeout} |
 %%                     ignore |
 %%                     {stop, Reason}
-%% @end
 %%--------------------------------------------------------------------
--spec init([]) -> {'ok', state(), kz_timeout()}.
+-spec init([]) -> {'ok', state()}.
 init([]) ->
-    {'ok', #state{}, ?POLLING_INTERVAL}.
+    {'ok', #state{}}.
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Handling call messages
-%%
+%% @doc Handling call messages
 %% @spec handle_call(Request, From, State) ->
 %%                                   {reply, Reply, State} |
 %%                                   {reply, Reply, State, Timeout} |
@@ -77,56 +113,45 @@ init([]) ->
 %%                                   {noreply, State, Timeout} |
 %%                                   {stop, Reason, Reply, State} |
 %%                                   {stop, Reason, State}
-%% @end
 %%--------------------------------------------------------------------
 -spec handle_call(any(), pid_ref(), state()) -> handle_call_ret_state(state()).
 handle_call(_Request, _From, State) ->
-    {'reply', {'error', 'not_implemented'}, State, ?POLLING_INTERVAL}.
+    {'reply', {'error', 'not_implemented'}, State}.
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Handling cast messages
-%%
+%% @doc Handling cast messages
 %% @spec handle_cast(Msg, State) -> {noreply, State} |
 %%                                  {noreply, State, Timeout} |
 %%                                  {stop, Reason, State}
-%% @end
 %%--------------------------------------------------------------------
 -spec handle_cast(any(), state()) -> handle_cast_ret_state(state()).
+handle_cast({'gen_listener', {'created_queue', _QueueNAme}}, State) ->
+    {'noreply', State};
+handle_cast({'gen_listener', {'is_consuming', _IsConsuming}}, State) ->
+    {'noreply', State};
 handle_cast(_Msg, State) ->
-    lager:debug("unhandled cast: ~p", [_Msg]),
-    {'noreply', State, ?POLLING_INTERVAL}.
+    {'noreply', State}.
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Handling all non call/cast messages
-%%
+%% @doc Handling all non call/cast messages
 %% @spec handle_info(Info, State) -> {noreply, State} |
 %%                                   {noreply, State, Timeout} |
 %%                                   {stop, Reason, State}
-%% @end
 %%--------------------------------------------------------------------
 -spec handle_info(any(), state()) -> handle_info_ret_state(state()).
-handle_info('timeout', State) ->
-    ViewOptions = ['reduce'
-                  ,'group'
-                  ,{'group_level', 1}
-                  ],
-    case kz_datamgr:get_result_keys(?KZ_FAXES_DB, <<"faxes/schedule_accounts">>, ViewOptions) of
-        {'ok', []} -> {'noreply', State, ?POLLING_INTERVAL};
-        {'ok', AccountIds} ->
-            _ = distribute_accounts(AccountIds),
-            _ = garbage_collect(),
-            {'noreply', State, ?POLLING_INTERVAL};
-        {'error', _Reason} ->
-            lager:debug("failed to fetch fax account jobs: ~p", [_Reason]),
-            {'noreply', State, ?POLLING_INTERVAL}
-    end;
 handle_info(_Info, State) ->
-    lager:debug("unhandled message: ~p", [_Info]),
-    {'noreply', State, ?POLLING_INTERVAL}.
+    {'noreply', State}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc Allows listener to pass options to handlers
+%% @spec handle_event(JObj, State) -> {reply, Options}
+%%--------------------------------------------------------------------
+-spec handle_event(kz_json:object(), kz_proplist()) -> gen_listener:handle_event_return().
+handle_event(_JObj, _State) ->
+    {'reply', []}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -135,21 +160,17 @@ handle_info(_Info, State) ->
 %% terminate. It should be the opposite of Module:init/1 and do any
 %% necessary cleaning up. When it returns, the gen_server terminates
 %% with Reason. The return value is ignored.
-%%
-%% @spec terminate(Reason, State) -> void()
 %% @end
+%% @spec terminate(Reason, State) -> void()
 %%--------------------------------------------------------------------
 -spec terminate(any(), state()) -> 'ok'.
 terminate(_Reason, _State) ->
-    lager:debug("fax jobs terminating: ~p", [_Reason]).
+    lager:debug("listener terminating: ~p", [_Reason]).
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Convert process state when code is changed
-%%
+%% @doc Convert process state when code is changed
 %% @spec code_change(OldVsn, State, Extra) -> {ok, NewState}
-%% @end
 %%--------------------------------------------------------------------
 -spec code_change(any(), state(), any()) -> {'ok', state()}.
 code_change(_OldVsn, State, _Extra) ->
@@ -158,17 +179,3 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
--spec distribute_accounts(ne_binaries()) -> ne_binaries().
-distribute_accounts([]) -> [];
-distribute_accounts([AccountId|AccountIds]) ->
-    maybe_start_account(fax_jobs:is_running(AccountId), AccountId),
-    distribute_accounts(AccountIds).
-
--spec maybe_start_account(boolean(), ne_binary()) -> 'ok'.
-maybe_start_account('true', _AccountId) -> 'ok';
-maybe_start_account('false', AccountId) ->
-    lager:debug("sending start fax account jobs for ~s", [AccountId]),
-    Payload = [{<<"Account-ID">>, AccountId}
-               | kz_api:default_headers(?APP_NAME, ?APP_VERSION)
-              ],
-    kz_amqp_worker:cast(Payload, fun kapi_fax:publish_start_account/1).
